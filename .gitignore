@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.env
+.env.local
+
+# WPPConnect session tokens ARE credentials — anyone with this folder is
+# logged into your WhatsApp. Never commit them.
+tokens/
+server/tokens/
+userDataDir/
+server/userDataDir/
+
+# Local database and received/uploaded media
+data/
+server/data/
+media/
+server/media/
+
+# Test artefacts
+*.png
+!client/public/*.png

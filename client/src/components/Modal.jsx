@@ -4,8 +4,11 @@ import { useEffect, useRef } from 'react';
  * A dialog built on <dialog>, so Escape and the backdrop come for free.
  * Centred explicitly, because the browser's own `margin: auto` is easily lost
  * to a reset.
+ *
+ * `size` widens it for content that needs the room — a step editor with a
+ * table of options is unreadable squeezed into a confirmation-box width.
  */
-export default function Modal({ open, title, onClose, children }) {
+export default function Modal({ open = true, title, size = 'md', onClose, children }) {
   const ref = useRef(null);
 
   useEffect(() => {
@@ -18,7 +21,7 @@ export default function Modal({ open, title, onClose, children }) {
   return (
     <dialog
       ref={ref}
-      className="modal"
+      className={`modal modal--${size}`}
       onClose={onClose}
       onClick={(e) => { if (e.target === ref.current) onClose(); }}
     >

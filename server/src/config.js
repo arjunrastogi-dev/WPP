@@ -64,6 +64,31 @@ export const config = {
     timezone: process.env.SCHEDULE_TIMEZONE ?? 'Asia/Kolkata',
   },
 
+  /*
+   * Google Sheets, for bot steps that log what they collected.
+   *
+   * A service account, not OAuth: the thing writing the row is a server with
+   * nobody sitting in front of it to re-approve an expired token. Share the
+   * sheet with the account's email the way you would with a colleague.
+   */
+  sheets: {
+    serviceAccountFile: process.env.GOOGLE_SERVICE_ACCOUNT_FILE ?? '',
+    serviceAccountJson: process.env.GOOGLE_SERVICE_ACCOUNT_JSON ?? '',
+  },
+
+  /*
+   * The official WhatsApp Business Cloud API, used per session.
+   *
+   * Credentials live on the session row rather than here, because one
+   * install can drive several numbers. Only the things shared by all of
+   * them sit in config.
+   */
+  cloud: {
+    version: process.env.CLOUD_API_VERSION ?? 'v21.0',
+    // Meta calls this back when registering the webhook; it must match.
+    verifyToken: process.env.CLOUD_VERIFY_TOKEN ?? 'change-me-verify-token',
+  },
+
   headless: process.env.HEADLESS !== 'false',
   chromePath: process.env.CHROME_PATH || undefined,
 

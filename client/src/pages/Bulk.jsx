@@ -14,7 +14,11 @@ import { parseRows, placeholdersIn } from '../lib/recipients';
 export default function Bulk() {
   const { sessions, active } = useSession();
   const [templates, setTemplates] = useState([]);
-  const [mode, setMode] = useState('template'); // template | custom
+  const [bots, setBots] = useState([]);
+  const [botId, setBotId] = useState('');
+  const [botStep, setBotStep] = useState('');
+  const [botSteps, setBotSteps] = useState([]);
+  const [mode, setMode] = useState('template'); // template | custom | bot
   const [templateKey, setTemplateKey] = useState('');
   const [custom, setCustom] = useState('');
   const [session, setSession] = useState(active ?? '');
@@ -28,6 +32,19 @@ export default function Bulk() {
   const [openBatch, setOpenBatch] = useState(null);
 
   useEffect(() => { api.templates().then(setTemplates).catch((e) => setError(e.message)); }, []);
+  useEffect(() => { api.bots().then(setBots).catch(() => {}); }, []);
+
+  // Only steps a person can actually answer may open a campaign.
+  useEffect(() => {
+    if (!botId) { setBotSteps([]); return; }
+    api.bot(botId)
+      .then((b) => {
+        const usable = (b.nodes ?? []).filter((n) => ['menu', 'prompt'].includes(n.kind));
+        setBotSteps(usable);
+        setBotStep((cur) => (usable.some((n) => n.node_key === cur) ? cur : b.entry_key));
+      })
+      .catch((e) => setError(e.message));
+  }, [botId]);
   useEffect(() => { if (active && !session) setSession(active); }, [active, session]);
 
   const template = templates.find((t) => t.template_key === templateKey);
@@ -37,12 +54,29 @@ export default function Bulk() {
    * the placeholders in order. A custom message honours {{placeholders}} too,
    * so a one-off can still be personalised without saving a template first.
    */
-  const columns = mode === 'template' ? (template?.variables ?? []) : placeholdersIn(custom);
+  const step = botSteps.find((n) => n.node_key === botStep);
+
+  const columns = mode === 'template'
+    ? (template?.variables ?? [])
+    : mode === 'bot'
+      ? placeholdersIn(step?.body ?? '')
+      : placeholdersIn(custom);
+
   const rows = parseRows(text, columns);
 
-  // Enough to work with? A template must be chosen; a custom message just needs text.
-  const ready = mode === 'template' ? Boolean(template) : custom.trim().length > 0;
-  const payload = mode === 'template' ? { template: templateKey } : { message: custom };
+  // Enough to work with? A template or a bot step must be chosen; a custom
+  // message only needs text.
+  const ready = mode === 'template'
+    ? Boolean(template)
+    : mode === 'bot'
+      ? Boolean(step)
+      : custom.trim().length > 0;
+
+  const payload = mode === 'template'
+    ? { template: templateKey }
+    : mode === 'bot'
+      ? { bot: botId, step: botStep }
+      : { message: custom };
 
   const runPreview = async () => {
     setBusy(true);
@@ -114,7 +148,8 @@ export default function Bulk() {
       <header className="page__head">
         <h1>Bulk send</h1>
         <p className="muted">
-          One message, many recipients — from a saved template or written here. Everything
+          One message, many recipients — from a saved template, written here, or as the
+          opening line of a bot conversation. Everything
           goes through the same queue and is spaced ~10 seconds apart, so a batch takes a
           while on purpose.
         </p>
@@ -148,11 +183,52 @@ export default function Bulk() {
             <select value={mode} onChange={(e) => { setMode(e.target.value); setPreview(null); }}>
               <option value="template">A saved template</option>
               <option value="custom">A custom message</option>
+              <option value="bot">A bot conversation</option>
             </select>
           </label>
         </div>
 
-        {mode === 'template' ? (
+        {mode === 'bot' ? (
+          <>
+            <div className="formgrid">
+              <label>Bot
+                <select value={botId} onChange={(e) => { setBotId(e.target.value); setPreview(null); }}>
+                  <option value="">Select a bot</option>
+                  {bots.filter((b) => b.enabled && b.steps > 0).map((b) => (
+                    <option key={b.id} value={b.id}>{b.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>Open with this step
+                <select value={botStep} onChange={(e) => { setBotStep(e.target.value); setPreview(null); }}
+                  disabled={!botId}>
+                  {botSteps.map((n) => (
+                    <option key={n.node_key} value={n.node_key}>
+                      {n.node_key} ({n.kind}{n.config?.display === 'list' ? ', tappable' : ''})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            {/*
+              * The point of this mode, stated plainly: the campaign is only the
+              * opening line, and the bot handles everything after it.
+              */}
+            <p className="muted">
+              Each person gets this step as their first message, and a conversation is opened
+              waiting on their answer — so whatever they tap or type is handled by the bot from
+              there, with no trigger word needed.
+              {step?.config?.display === 'list'
+                ? ' This step sends as a tappable list, falling back to the numbered version if WhatsApp refuses it.'
+                : null}
+            </p>
+
+            {botSteps.length === 0 && botId
+              ? <p className="error">That bot has no menu or question step to open with.</p>
+              : null}
+          </>
+        ) : mode === 'template' ? (
           <label>Template
             <select value={templateKey} onChange={(e) => { setTemplateKey(e.target.value); setPreview(null); }}>
               <option value="">Select a template</option>
@@ -206,6 +282,7 @@ export default function Bulk() {
               {preview.ready} ready · {preview.problems} with problems ·
               roughly {preview.estimatedMinutes} minute(s) to send
             </p>
+            {preview.conversation ? <p className="notice">{preview.conversation}</p> : null}
             <table className="table">
               <thead><tr><th>To</th><th>Message</th></tr></thead>
               <tbody>
@@ -236,6 +313,9 @@ export default function Bulk() {
         {result ? (
           <p className="notice">
             {result.queued} message(s) queued, finishing in about {result.estimatedMinutes} minute(s).
+            {result.conversations
+              ? ` ${result.conversations} conversation(s) are open and waiting for a reply.`
+              : ''}
           </p>
         ) : null}
 

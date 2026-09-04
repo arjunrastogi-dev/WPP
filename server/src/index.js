@@ -9,7 +9,7 @@ import { attachIo } from './events.js';
 import { ensureSeedUser, socketAuth } from './auth.js';
 import { listSessions, sessionState, stopAll, restoreSessions, startReconnectWatchdog, stopReconnectWatchdog } from './whatsapp.js';
 import { startQueue, stopQueue } from './queue.js';
-import { startRules } from './rules.js';
+import { startInbound } from './inbound.js';
 import { startScheduler, stopScheduler } from './schedule.js';
 import { startWebhooks } from './webhooks.js';
 import { ensureSeedTemplates } from './templates.js';
@@ -57,7 +57,7 @@ await ensureSeedUser();
 await ensureSeedTemplates();
 await startQueue();
 await startScheduler();
-startRules();
+startInbound();
 startWebhooks();
 
 server.listen(config.port, () => {

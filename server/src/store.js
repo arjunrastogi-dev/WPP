@@ -44,6 +44,14 @@ export const Sessions = {
   wanted: () => all("SELECT * FROM sessions WHERE auto_start = 1"),
 
   /** Records intent, not the live status: 1 = should be running. */
+  /** Point a session at a transport, with the credentials it needs. */
+  setProvider: (name, { provider, cloudPhoneId = null, cloudToken = null, cloudWabaId = null }) =>
+    run(
+      `UPDATE sessions SET provider = ?, cloud_phone_id = ?, cloud_token = ?, cloud_waba_id = ?
+        WHERE name = ?`,
+      provider, cloudPhoneId, cloudToken, cloudWabaId, name,
+    ),
+
   setWanted: (name, wanted) =>
     run(
       wanted
@@ -258,12 +266,17 @@ const WORKER_ID = `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
 export const Outbox = {
   workerId: WORKER_ID,
 
-  async enqueue({ session, chatId, kind = 'text', body, mediaPath, mediaName, sendAt, userId, expiresAt }) {
+  async enqueue({
+    session, chatId, kind = 'text', body, mediaPath, mediaName,
+    sendAt, userId, expiresAt, payload,
+  }) {
     const result = await run(
       `INSERT INTO outbox
-         (session, chat_id, kind, body, media_path, media_name, send_at, expires_at, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (session, chat_id, kind, body, media_path, media_name, payload,
+          send_at, expires_at, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       session, chatId, kind, body ?? null, mediaPath ?? null, mediaName ?? null,
+      payload ? JSON.stringify(payload) : null,
       sendAt ?? now(), expiresAt ?? null, userId ?? null, now(),
     );
     return get('SELECT * FROM outbox WHERE id = ?', result.insertId);
@@ -391,6 +404,190 @@ export const Templates = {
   },
 
   remove: (id) => run('DELETE FROM templates WHERE id = ?', id),
+};
+
+/* ---------------------------------- bots --------------------------------- */
+
+/** Chat tags, as a bot action sees them. */
+export const ChatTags = {
+  async get(session, chatId) {
+    const row = await get('SELECT tags FROM chats WHERE session = ? AND id = ?', session, chatId);
+    return safeJson(row?.tags, []);
+  },
+
+  async set(session, chatId, tags) {
+    await run(
+      'UPDATE chats SET tags = ? WHERE session = ? AND id = ?',
+      JSON.stringify([...new Set(tags)]), session, chatId,
+    );
+    return [...new Set(tags)];
+  },
+};
+
+
+const hydrateBot = (row) => row && ({ ...row, enabled: Boolean(row.enabled), allow_groups: Boolean(row.allow_groups) });
+const hydrateNode = (row) => row && ({
+  ...row,
+  options: safeJson(row.options, []),
+  config: safeJson(row.config, {}),
+});
+const hydrateBotChat = (row) => row && ({ ...row, variables: safeJson(row.variables, {}) });
+
+export const Bots = {
+  async create(b) {
+    const r = await run(
+      `INSERT INTO bot (name, session, trigger_event, trigger_type, trigger_text, entry_key,
+                        fallback, max_retries, timeout_minutes, allow_groups, enabled,
+                        owner_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      b.name, b.session ?? null, b.triggerEvent ?? 'message', b.triggerType, b.triggerText,
+      b.entryKey, b.fallback ?? null,
+      b.maxRetries ?? 2, b.timeoutMinutes ?? 30, b.allowGroups ? 1 : 0,
+      b.enabled === false ? 0 : 1, b.ownerId ?? null, now(), now(),
+    );
+    return Bots.get(r.insertId);
+  },
+
+  async update(id, b) {
+    await run(
+      `UPDATE bot SET name = ?, session = ?, trigger_event = ?, trigger_type = ?,
+              trigger_text = ?, entry_key = ?, fallback = ?, max_retries = ?,
+              timeout_minutes = ?, allow_groups = ?, enabled = ?, updated_at = ?
+        WHERE id = ?`,
+      b.name, b.session ?? null, b.triggerEvent ?? 'message', b.triggerType, b.triggerText,
+      b.entryKey, b.fallback ?? null,
+      b.maxRetries ?? 2, b.timeoutMinutes ?? 30, b.allowGroups ? 1 : 0,
+      b.enabled === false ? 0 : 1, now(), id,
+    );
+    return Bots.get(id);
+  },
+
+  async get(id) {
+    return hydrateBot(await get('SELECT * FROM bot WHERE id = ?', id));
+  },
+
+  async list({ userId, isAdmin } = {}) {
+    const rows = isAdmin || !userId
+      ? await all('SELECT * FROM bot ORDER BY enabled DESC, name')
+      : await all('SELECT * FROM bot WHERE owner_id = ? OR owner_id IS NULL ORDER BY enabled DESC, name', userId);
+    return rows.map(hydrateBot);
+  },
+
+  /** Every bot that could answer on this session, cheapest filter first. */
+  async live(session) {
+    const rows = await all(
+      'SELECT * FROM bot WHERE enabled = 1 AND (session IS NULL OR session = ?) ORDER BY id',
+      session,
+    );
+    return rows.map(hydrateBot);
+  },
+
+  setEnabled: (id, enabled) =>
+    run('UPDATE bot SET enabled = ?, updated_at = ? WHERE id = ?', enabled ? 1 : 0, now(), id),
+
+  remove: (id) => run('DELETE FROM bot WHERE id = ?', id),
+
+  /* ------------------------------- the steps ------------------------------ */
+
+  async nodes(botId) {
+    const rows = await all('SELECT * FROM bot_node WHERE bot_id = ? ORDER BY sort, id', botId);
+    return rows.map(hydrateNode);
+  },
+
+  async node(botId, key) {
+    return hydrateNode(await get('SELECT * FROM bot_node WHERE bot_id = ? AND node_key = ?', botId, key));
+  },
+
+  upsertNode: (botId, n) =>
+    run(
+      `INSERT INTO bot_node (bot_id, node_key, kind, body, options, config,
+                             save_as, next_key, sort, pos_x, pos_y)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE kind = VALUES(kind), body = VALUES(body),
+         options = VALUES(options), config = VALUES(config), save_as = VALUES(save_as),
+         next_key = VALUES(next_key), sort = VALUES(sort),
+         pos_x = VALUES(pos_x), pos_y = VALUES(pos_y)`,
+      botId, n.key, n.kind, n.body ?? '', JSON.stringify(n.options ?? []),
+      JSON.stringify(n.config ?? {}), n.saveAs ?? null, n.nextKey ?? null,
+      n.sort ?? 0, Math.round(n.x ?? 0), Math.round(n.y ?? 0),
+    ),
+
+  /** Move a step on the canvas without touching anything it does. */
+  moveNode: (botId, key, x, y) =>
+    run(
+      'UPDATE bot_node SET pos_x = ?, pos_y = ? WHERE bot_id = ? AND node_key = ?',
+      Math.round(x), Math.round(y), botId, key,
+    ),
+
+  removeNode: (botId, key) =>
+    run('DELETE FROM bot_node WHERE bot_id = ? AND node_key = ?', botId, key),
+
+  /* --------------------------- live conversations -------------------------- */
+
+  async chat(session, chatId) {
+    return hydrateBotChat(await get(
+      `SELECT * FROM bot_chat WHERE session = ? AND chat_id = ? AND status = 'active'
+        ORDER BY id DESC LIMIT 1`,
+      session, chatId,
+    ));
+  },
+
+  /**
+   * Open a conversation.
+   *
+   * `at` exists for campaigns. A batch of 200 goes out over half an hour, so a
+   * conversation created now for a message that leaves in twenty minutes must
+   * date from when it *arrives* — otherwise the idle timeout starts running
+   * before the person has been spoken to, and the earliest recipients get a
+   * bot that has already forgotten them.
+   */
+  async startChat({ botId, session, chatId, nodeKey, variables, at }) {
+    const when = at ?? now();
+    const r = await run(
+      `INSERT INTO bot_chat (bot_id, session, chat_id, node_key, variables, started_at, last_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      botId, session, chatId, nodeKey, JSON.stringify(variables ?? {}), when, when,
+    );
+    return hydrateBotChat(await get('SELECT * FROM bot_chat WHERE id = ?', r.insertId));
+  },
+
+  saveChat: (id, { nodeKey, variables, retries, status }) =>
+    run(
+      `UPDATE bot_chat SET node_key = ?, variables = ?, retries = ?, status = ?, last_at = ?
+        WHERE id = ?`,
+      nodeKey ?? null, JSON.stringify(variables ?? {}), retries ?? 0, status ?? 'active', now(), id,
+    ),
+
+  /** Close conversations nobody came back to. */
+  expireChats: (before) =>
+    run(
+      `UPDATE bot_chat SET status = 'expired' WHERE status = 'active' AND last_at < ?`,
+      before,
+    ),
+
+  /** Close whatever is open on a chat, so a campaign cannot double-book it. */
+  closeChats: (session, chatId) =>
+    run(
+      `UPDATE bot_chat SET status = 'expired'
+        WHERE session = ? AND chat_id = ? AND status = 'active'`,
+      session, chatId,
+    ),
+
+  logEvent: ({ botChatId, direction, nodeKey, body }) =>
+    run(
+      'INSERT INTO bot_event (bot_chat_id, direction, node_key, body, at) VALUES (?, ?, ?, ?, ?)',
+      botChatId, direction, nodeKey ?? null, body ?? null, now(),
+    ),
+
+  conversations: (botId, limit = 30) =>
+    all(
+      `SELECT c.*, (SELECT COUNT(*) FROM bot_event e WHERE e.bot_chat_id = c.id) AS turns
+         FROM bot_chat c WHERE c.bot_id = ? ORDER BY c.last_at DESC LIMIT ?`,
+      botId, limit,
+    ),
+
+  transcript: (botChatId) =>
+    all('SELECT * FROM bot_event WHERE bot_chat_id = ? ORDER BY at, id', botChatId),
 };
 
 /* -------------------------------- schedules ------------------------------ */

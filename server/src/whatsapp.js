@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import wppconnect from '@wppconnect-team/wppconnect';
 
 import { config } from './config.js';
+import { sendCloud, isCloudSession } from './cloud.js';
 import { publish } from './events.js';
 import { Sessions, Chats, Messages, Identity } from './store.js';
 import { all, get, run } from './db.js';
@@ -306,6 +307,28 @@ export const isConversation = (chatId) =>
 
 export const isSystemMessage = (type) => SYSTEM_TYPES.has(String(type ?? '').toLowerCase());
 
+/**
+ * What someone tapped, out of a list or button reply.
+ *
+ * WhatsApp Web has moved this field around between builds, so every shape it
+ * has used is checked rather than trusting one — a miss here is invisible and
+ * makes the bot look broken.
+ */
+export function selectedChoice(message) {
+  if (!message) return null;
+
+  const type = String(message.type ?? '').toLowerCase();
+  if (!['list_response', 'buttons_response', 'template_button_reply'].includes(type)) return null;
+
+  const list = message.listResponse ?? message.singleSelectReply ?? null;
+  const id = message.selectedRowId ?? message.selectedButtonId ?? message.selectedId
+    ?? list?.selectedRowId ?? list?.singleSelectReply?.selectedRowId ?? null;
+  const title = message.selectedDisplayText ?? message.title ?? list?.title
+    ?? message.body ?? null;
+
+  return (id || title) ? { id: id ?? null, title: title ?? null } : null;
+}
+
 /** Message types that carry a downloadable attachment. */
 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'ptt', 'sticker', 'document']);
 
@@ -513,16 +536,31 @@ function registerListeners(name, client) {
     const hasMedia = isMediaMessage(message);
     const mediaPath = hasMedia ? await saveIncomingMedia(client, message) : null;
 
+    /*
+     * A tapped list row or button arrives as its own message type, and the
+     * text of the choice is not always in `body`. Without this, tapping an
+     * option looks to the bot like an empty message and it re-asks the
+     * question the person just answered.
+     */
+    const tapped = selectedChoice(message);
+
     const author = message.sender?.pushname ?? message.notifyName ?? chatId;
     // For media, WhatsApp puts a base64 JPEG thumbnail in `body`. Storing that
     // as the message text is what rendered attachments as a wall of characters.
-    const body = hasMedia ? (message.caption ?? '') : (message.body ?? '');
+    const body = hasMedia
+      ? (message.caption ?? '')
+      : (tapped?.title || message.body || '');
 
     const saved = await Messages.insert({
       waId: message.id, session: name, chatId, direction: 'in', author, body,
       type: message.type ?? 'chat', mediaPath, mediaName: message.filename ?? null,
       mimetype: message.mimetype ?? null, ack: 0, timestamp,
     });
+
+    // The row id travels beside the text: a bot can then match the exact
+    // option that was tapped rather than guessing from a label someone may
+    // also have typed by hand.
+    if (tapped?.id) saved.selectedId = tapped.id;
 
     const chat = await Chats.touch({
       session: name, id: chatId, name: author, isGroup,
@@ -646,8 +684,110 @@ export async function backfillMedia(session, limit = 25) {
  * Actually push a message to WhatsApp. Only the queue worker calls this —
  * routes enqueue instead, so nothing bypasses the rate limiter.
  */
-export async function deliver({ session, chatId, kind, body, mediaPath, mediaName }) {
+/**
+ * Send an interactive message by calling wa-js directly, in the page.
+ *
+ * `client.sendText` cannot be used for these. It sends the message and then
+ * re-fetches it by id to return a full object — and that second step is
+ * fragile for an interactive message, whose nested button structures do not
+ * always survive the round trip. When it fails it throws, so a message that
+ * was *already delivered* is reported as an error, and any fallback then sends
+ * the whole thing again as plain text. That is almost certainly why buttons
+ * appeared never to arrive: they were sent, mis-reported as failures, and
+ * immediately buried under a duplicate.
+ *
+ * Going straight to `WPP.chat.sendTextMessage` skips the verification and
+ * returns what the send itself said. The result is flattened to a plain object
+ * inside the page, because Puppeteer cannot serialise wa-js's message classes.
+ */
+async function sendInPage(client, { chatId, body, options }) {
+  return client.page.evaluate(
+    ({ to, text, opts }) => window.WPP.chat
+      .sendTextMessage(to, text, { ...opts, waitForAck: true })
+      .then((r) => ({ ok: true, id: r?.id?._serialized ?? String(r?.id ?? ''), ack: r?.ack ?? null }))
+      .catch((e) => ({ ok: false, error: String(e?.message ?? e) })),
+    { to: chatId, text: body ?? '', opts: options },
+  );
+}
+
+/**
+ * The four interactive shapes WhatsApp understands, and how to send each.
+ *
+ * None of these appear in WPPConnect's typed API. They are reachable anyway:
+ * wa-js runs every outgoing message through `prepareMessageButtons`, which
+ * turns a `buttons` option into a real `interactiveMessage` with a
+ * `nativeFlowMessage` — `{id, text}` becomes a quick reply, and `url`,
+ * `phoneNumber` or `code` become cta_url, cta_call and cta_copy.
+ *
+ * WhatsApp's rules, which wa-js enforces and we enforce earlier with better
+ * wording: one to three buttons, at most two alongside media, and reply
+ * buttons never mixed with action buttons on one message.
+ *
+ * The plain-text version still travels in `body`. If a send genuinely fails,
+ * that is what arrives, so nobody is left unable to answer.
+ */
+async function deliverInteractive({ client, chatId, body, payload }) {
+  const options = typeof payload === 'string' ? JSON.parse(payload) : payload;
+  const asText = () => client.sendText(chatId, body ?? '');
+  const shape = options.mode ?? 'list';
+
+  if (shape === 'list') {
+    try {
+      const sent = await client.sendListMessage(chatId, {
+        buttonText: options.buttonText || 'Choose',
+        description: options.description ?? body ?? '',
+        sections: options.sections ?? [],
+      });
+      console.log(`[wpp] sent a list of ${(options.sections?.[0]?.rows ?? []).length} row(s) to ${chatId}`);
+      return sent;
+    } catch (err) {
+      console.warn(`[wpp] list REFUSED for ${chatId}: ${err.message}`);
+      return asText();
+    }
+  }
+
+  const buttons = options.buttons ?? [];
+  const result = await sendInPage(client, {
+    chatId,
+    body: options.description ?? body ?? '',
+    options: {
+      buttons,
+      title: options.title || undefined,
+      footer: options.footer || undefined,
+    },
+  });
+
+  if (result?.ok) {
+    console.log(`[wpp] sent ${shape} with ${buttons.length} button(s) to ${chatId} (${result.id})`);
+    return { id: result.id };
+  }
+
+  /*
+   * Logged loudly and with the reason. Whether WhatsApp accepts interactive
+   * messages depends on the account and the recipient, and a silent downgrade
+   * to text looks identical to the feature never having been built.
+   */
+  console.warn(`[wpp] ${shape} REFUSED for ${chatId}: ${result?.error ?? 'unknown error'}`);
+  console.warn('[wpp] falling back to the plain-text version, so the person can still answer');
+  return asText();
+}
+
+export async function deliver({ session, chatId, kind, body, mediaPath, mediaName, payload }) {
+  /*
+   * Which transport this session uses is decided per message rather than
+   * cached, so switching a number to the Business API takes effect on the next
+   * send instead of on the next restart.
+   */
+  const row = await Sessions.get(session);
+  if (isCloudSession(row)) {
+    return sendCloud({ row, chatId, body, payload: kind === 'list' ? payload : null });
+  }
+
   const client = getClient(session);
+
+  if (kind === 'list' && payload) {
+    return deliverInteractive({ client, chatId, body, payload });
+  }
 
   if (kind === 'media' && mediaPath) {
     const abs = path.join(config.mediaDir, mediaPath);
@@ -658,6 +798,75 @@ export async function deliver({ session, chatId, kind, body, mediaPath, mediaNam
   }
 
   return client.sendText(chatId, body ?? '');
+}
+
+/**
+ * Send one of each interactive shape and report exactly what happened.
+ *
+ * Whether a given WhatsApp account may send buttons is not something that can
+ * be discovered by reading code — it depends on the sender, the recipient and
+ * whatever Meta changed this month, and a refusal is often silent. So rather
+ * than guess, this sends all four shapes to a number of your choosing and
+ * returns the raw result of each. Whichever ones appear on the phone are the
+ * ones this account can use.
+ */
+export async function probeInteractive(session, chatId) {
+  const client = getClient(session);
+  const results = [];
+
+  const attempt = async (label, fn) => {
+    const started = Date.now();
+    try {
+      const out = await fn();
+      results.push({
+        shape: label,
+        ok: out?.ok !== false,
+        detail: out?.error ?? out?.id ?? 'sent',
+        ms: Date.now() - started,
+      });
+    } catch (err) {
+      results.push({ shape: label, ok: false, detail: err.message, ms: Date.now() - started });
+    }
+  };
+
+  await attempt('text', () => client.sendText(chatId, 'Probe 1 of 4: plain text. This one always works.'));
+
+  await attempt('buttons', () => sendInPage(client, {
+    chatId,
+    body: 'Probe 2 of 4: quick reply buttons. Can you tap these?',
+    options: {
+      buttons: [
+        { id: 'probe:0', text: 'Yes I can' },
+        { id: 'probe:1', text: 'No buttons' },
+      ],
+      title: 'Interactive probe',
+      footer: 'Sent from the bot builder',
+    },
+  }));
+
+  await attempt('list', () => client.sendListMessage(chatId, {
+    buttonText: 'Open the list',
+    description: 'Probe 3 of 4: a tappable list. Does a button appear below this?',
+    sections: [{
+      title: 'Choices',
+      rows: [
+        { rowId: 'probe:0', title: 'First row', description: 'With a description' },
+        { rowId: 'probe:1', title: 'Second row' },
+      ],
+    }],
+  }));
+
+  await attempt('cta', () => sendInPage(client, {
+    chatId,
+    body: 'Probe 4 of 4: an action button. Is there a link button below?',
+    options: {
+      buttons: [{ text: 'Open a website', url: 'https://wppconnect.io' }],
+      title: 'Interactive probe',
+    },
+  }));
+
+  console.log('[wpp] interactive probe: ' + results.map((r) => `${r.shape}=${r.ok ? 'sent' : 'FAILED'}`).join(' '));
+  return results;
 }
 
 /** Ask WhatsApp whether a number exists, rather than guessing country codes. */

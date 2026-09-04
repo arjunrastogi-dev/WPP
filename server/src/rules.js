@@ -1,13 +1,17 @@
-import { bus } from './events.js';
 import { Rules } from './store.js';
 import { enqueue } from './queue.js';
 
 /**
  * Auto-reply engine.
  *
- * Subscribes to inbound messages and enqueues a reply when a rule matches.
- * Replies go through the same rate-limited queue as everything else, so a
- * burst of inbound traffic can't turn into a burst of outbound traffic.
+ * Enqueues a reply when a rule matches. Replies go through the same
+ * rate-limited queue as everything else, so a burst of inbound traffic can't
+ * turn into a burst of outbound traffic.
+ *
+ * This no longer subscribes to the bus itself — see `startInbound` in
+ * inbound.js, which decides whether a bot or a rule answers a given message.
+ * Two independent subscribers would each reply, and the person would get two
+ * messages for one question.
  */
 
 function matches(rule, text) {
@@ -37,26 +41,21 @@ function render(template, { author, body }) {
     .replaceAll('{{body}}', body ?? '');
 }
 
-export function startRules() {
-  // The bus is synchronous, so this handler must own its own error handling —
-  // an unhandled rejection here would take the process down.
-  bus.on('message', ({ session, message }) => {
-    if (message.direction !== 'in') return; // never reply to ourselves
+/**
+ * Try the rules against one inbound message. Returns true if one replied.
+ */
+export async function applyRules({ session, message }) {
+  const rules = await Rules.active(session);
+  const rule = rules.find((r) => matches(r, message.body));
+  if (!rule) return false;
 
-    (async () => {
-      const rules = await Rules.active(session);
-      const rule = rules.find((r) => matches(r, message.body));
-      if (!rule) return;
-
-      console.log(`[rules:${session}] "${rule.name}" matched -> replying to ${message.chat_id}`);
-      await enqueue({
-        session,
-        chatId: message.chat_id,
-        body: render(rule.reply, { author: message.author, body: message.body }),
-      });
-    })().catch((err) => console.error('[rules]', err));
+  console.log(`[rules:${session}] "${rule.name}" matched -> replying to ${message.chat_id}`);
+  await enqueue({
+    session,
+    chatId: message.chat_id,
+    body: render(rule.reply, { author: message.author, body: message.body }),
   });
-  console.log('[rules] auto-reply engine active');
+  return true;
 }
 
 export const _internals = { matches, render };

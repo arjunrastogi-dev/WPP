@@ -42,6 +42,7 @@ async function drainSession(name) {
       body: job.body,
       mediaPath: job.media_path,
       mediaName: job.media_name,
+      payload: job.payload,
     });
 
     await Outbox.markSent(job.id);

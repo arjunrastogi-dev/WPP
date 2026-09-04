@@ -161,6 +161,85 @@ const SCHEMA = [
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
   /*
+   * FAQ / menu bots.
+   *
+   * The auto-reply rules table answers one message at a time and forgets. A
+   * bot holds a conversation: it knows which question it just asked, so "2"
+   * can mean something.
+   */
+  `CREATE TABLE IF NOT EXISTS bot (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    name            VARCHAR(120) NOT NULL,
+    session         VARCHAR(64),
+    trigger_type    VARCHAR(16) NOT NULL DEFAULT 'contains',
+    trigger_text    VARCHAR(200) NOT NULL DEFAULT 'hi',
+    entry_key       VARCHAR(64) NOT NULL DEFAULT 'start',
+    fallback        TEXT,
+    max_retries     TINYINT NOT NULL DEFAULT 2,
+    timeout_minutes INT NOT NULL DEFAULT 30,
+    allow_groups    TINYINT NOT NULL DEFAULT 0,
+    enabled         TINYINT NOT NULL DEFAULT 1,
+    owner_id        INT NULL,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL,
+    KEY idx_bot_live (enabled, session),
+    CONSTRAINT fk_bot_user FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  /*
+   * One step of a flow. `options` is JSON rather than its own table because a
+   * step is only ever edited as a whole — splitting it would buy nothing but
+   * a join and a chance for the two to disagree.
+   */
+  `CREATE TABLE IF NOT EXISTS bot_node (
+    id        INT AUTO_INCREMENT PRIMARY KEY,
+    bot_id    INT NOT NULL,
+    node_key  VARCHAR(64) NOT NULL,
+    kind      VARCHAR(16) NOT NULL DEFAULT 'menu',
+    body      TEXT NOT NULL,
+    options   TEXT,
+    save_as   VARCHAR(64),
+    next_key  VARCHAR(64),
+    sort      INT NOT NULL DEFAULT 0,
+    UNIQUE KEY uniq_node (bot_id, node_key),
+    CONSTRAINT fk_node_bot FOREIGN KEY (bot_id) REFERENCES bot(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  /*
+   * Where one person currently stands in one flow.
+   *
+   * Keyed by chat, not by person: the same human on a second number is a
+   * second conversation, which is the behaviour anyone would expect.
+   */
+  `CREATE TABLE IF NOT EXISTS bot_chat (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    bot_id     INT NOT NULL,
+    session    VARCHAR(64) NOT NULL,
+    chat_id    VARCHAR(128) NOT NULL,
+    node_key   VARCHAR(64),
+    variables  TEXT,
+    retries    TINYINT NOT NULL DEFAULT 0,
+    status     VARCHAR(16) NOT NULL DEFAULT 'active',
+    started_at BIGINT NOT NULL,
+    last_at    BIGINT NOT NULL,
+    KEY idx_chat_live (session, chat_id, status),
+    CONSTRAINT fk_chat_bot FOREIGN KEY (bot_id) REFERENCES bot(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  /* The transcript, so a flow that confuses people can be seen doing it. */
+  `CREATE TABLE IF NOT EXISTS bot_event (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    bot_chat_id INT NOT NULL,
+    direction   VARCHAR(4) NOT NULL,
+    node_key    VARCHAR(64),
+    body        TEXT,
+    at          BIGINT NOT NULL,
+    KEY idx_event_chat (bot_chat_id, at),
+    CONSTRAINT fk_event_chat FOREIGN KEY (bot_chat_id)
+      REFERENCES bot_chat(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  /*
    * Recurring sends — the "alarm clock".
    *
    * `next_run_at` is stored rather than computed on read, so the ticker can
@@ -321,6 +400,50 @@ const MIGRATIONS = [
 
   // When a held message stops being worth sending.
   `ALTER TABLE outbox ADD COLUMN IF NOT EXISTS expires_at BIGINT`,
+
+  /*
+   * Where each step sits on the builder canvas, and whatever settings its kind
+   * needs (a spreadsheet id, a delay, the branches of a condition).
+   *
+   * Position is presentation, not behaviour — the flow runs identically
+   * whatever the coordinates say — but it has to persist, or every reopen
+   * scatters a carefully arranged diagram.
+   */
+  /*
+   * The list/section structure of an interactive message.
+   *
+   * Kept beside the plain-text version rather than instead of it: interactive
+   * sends are refused often enough that every one of them needs a fallback,
+   * and the fallback has to survive in the queue too.
+   */
+  `ALTER TABLE outbox ADD COLUMN IF NOT EXISTS payload TEXT`,
+
+  /*
+   * What kind of event starts a bot, as opposed to what the message says.
+   *
+   * A keyword is only one way in: a flow can also open on someone's first
+   * message of the day, or on anything nothing else answered. Keeping the
+   * event separate from the keyword means both questions can be asked.
+   */
+  `ALTER TABLE bot ADD COLUMN IF NOT EXISTS trigger_event VARCHAR(24) NOT NULL DEFAULT 'message'`,
+
+  /*
+   * How a session actually sends.
+   *
+   * 'web' drives WhatsApp Web through a browser, which cannot deliver
+   * interactive messages; 'cloud' goes through Meta's Business API, which
+   * can. The credentials belong to the number, so they live on its row.
+   */
+  `ALTER TABLE sessions
+     ADD COLUMN IF NOT EXISTS provider VARCHAR(12) NOT NULL DEFAULT 'web',
+     ADD COLUMN IF NOT EXISTS cloud_phone_id VARCHAR(40),
+     ADD COLUMN IF NOT EXISTS cloud_token TEXT,
+     ADD COLUMN IF NOT EXISTS cloud_waba_id VARCHAR(40)`,
+
+  `ALTER TABLE bot_node
+     ADD COLUMN IF NOT EXISTS pos_x INT NOT NULL DEFAULT 0,
+     ADD COLUMN IF NOT EXISTS pos_y INT NOT NULL DEFAULT 0,
+     ADD COLUMN IF NOT EXISTS config TEXT`,
 ];
 
 const REPAIRS = [

@@ -1,5 +1,6 @@
 import { config } from './config.js';
-import { Bulk } from './store.js';
+import { Bulk, Bots } from './store.js';
+import { renderNode, buildList } from './bots.js';
 import { renderTemplate, render } from './templates.js';
 import { enqueue } from './queue.js';
 import { toChatId } from './whatsapp.js';
@@ -53,6 +54,35 @@ export async function renderFor({ template, message, variables }) {
  * is much worse than a rejected one, and the caller can only make that choice
  * if it learns about every problem before the first message moves.
  */
+/**
+ * Render a campaign that opens a bot conversation.
+ *
+ * The opening message is one of the bot's own steps, so a campaign and a
+ * conversation that started with "hi" arrive looking identical — there is only
+ * one flow, entered two ways.
+ */
+export async function renderBotStart({ node, recipients }) {
+  const rendered = [];
+  const problems = [];
+
+  for (const [index, r] of recipients.entries()) {
+    try {
+      const variables = r.variables ?? {};
+      rendered.push({
+        to: toChatId(r.to),
+        text: renderNode(node, variables),
+        list: node.kind === 'menu' && ['list', 'buttons'].includes(node.config?.display)
+          ? buildList(node, variables)
+          : null,
+        variables,
+      });
+    } catch (err) {
+      problems.push({ index, to: r.to, error: err.message });
+    }
+  }
+  return { rendered, problems };
+}
+
 export async function renderAll({ template, message, recipients }) {
   const rendered = [];
   const problems = [];
@@ -77,7 +107,7 @@ export async function renderAll({ template, message, recipients }) {
  * still leaves a trace of what was attempted rather than nothing at all.
  */
 export async function queueBatch({
-  session, template, message, rendered, userId, startAt, refPrefix = 'bulk',
+  session, template, message, rendered, userId, startAt, refPrefix = 'bulk', botStart = null,
 }) {
   const begin = startAt ? Number(startAt) : Date.now();
   const batchRef = `${refPrefix}-${Date.now()}`;
@@ -85,26 +115,51 @@ export async function queueBatch({
   const batch = await Bulk.createBatch({
     batchRef,
     session,
-    source: template ? 'template' : 'custom',
-    templateKey: template ?? null,
+    source: botStart ? 'bot' : (template ? 'template' : 'custom'),
+    templateKey: template ?? (botStart ? `${botStart.bot.name} · ${botStart.node.node_key}` : null),
     // A custom message is stored verbatim; a template only by key, since the
     // template itself is already versioned in its own table.
-    body: template ? null : message,
+    body: botStart ? rendered[0]?.text ?? null : (template ? null : message),
     total: rendered.length,
     userId: userId ?? null,
   });
 
   const jobs = [];
   for (const [i, item] of rendered.entries()) {
+    const sendAt = begin + i * SPREAD_MS;
     const job = await enqueue({
       session,
       chatId: item.to,
       body: item.text,
+      // A campaign opening with a tappable menu carries the interactive form
+      // beside the text, exactly as the bot's own menus do.
+      kind: item.list ? 'list' : 'text',
+      payload: item.list ?? undefined,
       // Stagger on top of the queue's own pacing.
-      sendAt: begin + i * SPREAD_MS,
-      expiresAt: begin + i * SPREAD_MS + config.queue.ttlHours * 3600000,
+      sendAt,
+      expiresAt: sendAt + config.queue.ttlHours * 3600000,
     });
     jobs.push(job);
+
+    /*
+     * Park a conversation waiting at the step we just sent.
+     *
+     * This is what makes a tap work. The bot normally starts when someone says
+     * a trigger word; a campaign has no trigger, so the conversation is opened
+     * here and the reply — typed or tapped — is read as an answer to the menu
+     * that was sent, not as the start of something new.
+     */
+    if (botStart) {
+      await Bots.closeChats(session, item.to);
+      await Bots.startChat({
+        botId: botStart.bot.id,
+        session,
+        chatId: item.to,
+        nodeKey: botStart.node.node_key,
+        variables: item.variables,
+        at: sendAt,
+      });
+    }
     // The rendered text is kept per recipient: the template can be edited
     // tomorrow, and then it no longer tells you what actually went out.
     await Bulk.addRecipient(batch.id, item.to, job.id, item.text);

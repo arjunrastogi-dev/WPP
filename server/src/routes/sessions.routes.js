@@ -3,7 +3,10 @@ import { route } from '../http.js';
 import { requireAdmin } from '../auth.js';
 import { Sessions, Messages } from '../store.js';
 import { all } from '../db.js';
-import { listSessions, sessionState, startSession, stopSession, closeAllBrowsers, mergeLidChats } from '../whatsapp.js';
+import {
+  listSessions, sessionState, startSession, stopSession, closeAllBrowsers, mergeLidChats,
+  probeInteractive, toChatId, isConnected,
+} from '../whatsapp.js';
 
 const router = Router();
 
@@ -116,6 +119,74 @@ router.delete('/:name', route(async (req, res) => {
   await stopSession(req.params.name, { logout: false });
   await Sessions.remove(req.params.name);
   res.json({ ok: true });
+}));
+
+/**
+ * PUT /api/sessions/:name/provider — send through Meta instead of the browser.
+ *
+ * The one thing this unlocks is interactive messages: buttons and lists are
+ * delivered by the Business API and silently dropped by WhatsApp Web.
+ */
+router.put('/:name/provider', route(async (req, res) => {
+  if (!(await mayUse(req, res))) return;
+
+  const provider = String(req.body?.provider ?? 'web');
+  if (!['web', 'cloud'].includes(provider)) {
+    return res.status(400).json({ error: "provider must be 'web' or 'cloud'" });
+  }
+
+  if (provider === 'cloud') {
+    const phoneId = String(req.body?.cloudPhoneId ?? '').trim();
+    const token = String(req.body?.cloudToken ?? '').trim();
+    if (!phoneId) return res.status(400).json({ error: 'The phone number id from Meta is required' });
+    if (!token) return res.status(400).json({ error: 'A permanent access token is required' });
+
+    await Sessions.setProvider(req.params.name, {
+      provider,
+      cloudPhoneId: phoneId,
+      cloudToken: token,
+      cloudWabaId: String(req.body?.cloudWabaId ?? '').trim() || null,
+    });
+  } else {
+    await Sessions.setProvider(req.params.name, { provider });
+  }
+
+  const row = await Sessions.get(req.params.name);
+  // The token is never echoed back; only whether one is stored.
+  res.json({
+    name: row.name,
+    provider: row.provider,
+    cloudPhoneId: row.cloud_phone_id,
+    hasToken: Boolean(row.cloud_token),
+  });
+}));
+
+/**
+ * POST /api/sessions/:name/probe — find out what this number can actually send.
+ *
+ * Sends a plain message, quick reply buttons, a list and an action button to
+ * one number, and reports what each attempt returned. Look at the phone: the
+ * shapes that arrived are the ones this account supports. It is the only
+ * reliable way to know, because WhatsApp refuses interactive messages silently.
+ */
+router.post('/:name/probe', route(async (req, res) => {
+  if (!(await mayUse(req, res))) return;
+
+  const to = String(req.body?.to ?? '').trim();
+  if (!to) return res.status(400).json({ error: 'Which number should the probe go to?' });
+  if (!isConnected(req.params.name)) {
+    return res.status(409).json({ error: `Session "${req.params.name}" is not connected` });
+  }
+
+  const chatId = toChatId(to);
+  const results = await probeInteractive(req.params.name, chatId);
+
+  res.json({
+    to: chatId,
+    results,
+    note: 'Check the phone. Whatever arrived is what this account can send; '
+      + 'anything reported as sent but not visible was refused silently by WhatsApp.',
+  });
 }));
 
 export default router;

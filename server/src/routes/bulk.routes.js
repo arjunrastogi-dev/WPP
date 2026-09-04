@@ -2,8 +2,8 @@ import { Router } from 'express';
 import { route } from '../http.js';
 import { config } from '../config.js';
 import { all, get } from '../db.js';
-import { Sessions, Outbox, Bulk } from '../store.js';
-import { renderFor, renderAll, queueBatch, SPREAD_MS } from '../dispatch.js';
+import { Sessions, Outbox, Bulk, Bots } from '../store.js';
+import { renderFor, renderAll, renderBotStart, queueBatch, SPREAD_MS } from '../dispatch.js';
 import { toChatId, isConnected } from '../whatsapp.js';
 
 /**
@@ -19,20 +19,77 @@ import { toChatId, isConnected } from '../whatsapp.js';
  */
 const router = Router();
 
-/** POST /api/bulk/preview — render every row without sending, to catch mistakes first. */
-router.post('/preview', route(async (req, res) => {
-  const { template, message, recipients } = req.body ?? {};
-  if ((!template && !message) || !Array.isArray(recipients)) {
-    return res.status(400).json({ error: 'recipients[] plus either template or message are required' });
+/**
+ * A campaign can open with one of a bot's own steps instead of a flat message.
+ *
+ * Resolved here so preview and send agree on what "bot 3, step ask_role" means,
+ * and so a step deleted between the two is caught rather than sent.
+ */
+async function resolveBotStart({ bot: botId, step }, req) {
+  if (!botId) return null;
+
+  const bot = await Bots.get(Number(botId));
+  if (!bot) { const e = new Error(`No bot ${botId}`); e.status = 404; throw e; }
+  if (bot.owner_id && bot.owner_id !== req.user.id && req.user.role !== 'admin') {
+    const e = new Error('That bot belongs to someone else'); e.status = 403; throw e;
   }
 
-  const rows = [];
-  for (const [index, r] of recipients.slice(0, config.bulk.maxRecipients).entries()) {
+  const node = await Bots.node(bot.id, String(step || bot.entry_key));
+  if (!node) {
+    const e = new Error(`That bot has no step called "${step || bot.entry_key}"`);
+    e.status = 404; throw e;
+  }
+
+  /*
+   * A campaign has to leave the conversation somewhere it can be answered.
+   * Opening with an ending or a hand-over sends a message and then parks a
+   * conversation nobody is able to reply to.
+   */
+  if (!['menu', 'prompt'].includes(node.kind)) {
+    const e = new Error(
+      `A campaign has to open with a menu or a question, and "${node.node_key}" is a ${node.kind} step.`,
+    );
+    e.status = 400; throw e;
+  }
+
+  return { bot, node };
+}
+
+/** POST /api/bulk/preview — render every row without sending, to catch mistakes first. */
+router.post('/preview', route(async (req, res) => {
+  const { template, message, bot, step, recipients } = req.body ?? {};
+  if ((!template && !message && !bot) || !Array.isArray(recipients)) {
+    return res.status(400).json({
+      error: 'recipients[] plus one of template, message or bot are required',
+    });
+  }
+
+  let botStart = null;
+  if (bot) {
     try {
-      const text = await renderFor({ template, message, variables: r.variables });
-      rows.push({ index, to: toChatId(r.to), ok: true, preview: text });
+      botStart = await resolveBotStart({ bot, step }, req);
     } catch (err) {
-      rows.push({ index, to: r.to, ok: false, error: err.message, missing: err.missing });
+      return res.status(err.status ?? 400).json({ error: err.message });
+    }
+  }
+
+  const capped = recipients.slice(0, config.bulk.maxRecipients);
+  const rows = [];
+
+  if (botStart) {
+    const { rendered, problems } = await renderBotStart({ node: botStart.node, recipients: capped });
+    rendered.forEach((r, index) => rows.push({
+      index, to: r.to, ok: true, preview: r.text, tappable: Boolean(r.list),
+    }));
+    problems.forEach((pr) => rows.push({ index: pr.index, to: pr.to, ok: false, error: pr.error }));
+  } else {
+    for (const [index, r] of capped.entries()) {
+      try {
+        const text = await renderFor({ template, message, variables: r.variables });
+        rows.push({ index, to: toChatId(r.to), ok: true, preview: text });
+      } catch (err) {
+        rows.push({ index, to: r.to, ok: false, error: err.message, missing: err.missing });
+      }
     }
   }
 
@@ -43,17 +100,23 @@ router.post('/preview', route(async (req, res) => {
     problems: bad,
     // Roughly how long the batch will take, so nobody expects it to be instant.
     estimatedMinutes: Math.ceil((rows.length * SPREAD_MS) / 60000),
+    // What happens after they answer, so nobody sends a campaign expecting a
+    // conversation and gets silence.
+    conversation: botStart
+      ? `Replies are handled by "${botStart.bot.name}", starting at "${botStart.node.node_key}".`
+      : null,
     rows,
   });
 }));
 
 /** POST /api/bulk/send — queue the batch. */
 router.post('/send', route(async (req, res) => {
-  const { session, template, message, recipients, startAt } = req.body ?? {};
+  const { session, template, message, bot, step, recipients, startAt } = req.body ?? {};
 
-  if (!session || (!template && !message) || !Array.isArray(recipients) || recipients.length === 0) {
+  if (!session || (!template && !message && !bot)
+      || !Array.isArray(recipients) || recipients.length === 0) {
     return res.status(400).json({
-      error: 'session, a non-empty recipients[], and either template or message are required',
+      error: 'session, a non-empty recipients[], and one of template, message or bot are required',
     });
   }
   if (recipients.length > config.bulk.maxRecipients) {
@@ -71,7 +134,19 @@ router.post('/send', route(async (req, res) => {
     });
   }
 
-  const { rendered, problems } = await renderAll({ template, message, recipients });
+  let botStart = null;
+  if (bot) {
+    try {
+      botStart = await resolveBotStart({ bot, step }, req);
+    } catch (err) {
+      return res.status(err.status ?? 400).json({ error: err.message });
+    }
+  }
+
+  const { rendered, problems } = botStart
+    ? await renderBotStart({ node: botStart.node, recipients })
+    : await renderAll({ template, message, recipients });
+
   if (problems.length) {
     return res.status(400).json({
       error: `${problems.length} of ${recipients.length} rows could not be rendered. Nothing was sent.`,
@@ -80,7 +155,7 @@ router.post('/send', route(async (req, res) => {
   }
 
   const batch = await queueBatch({
-    session, template, message, rendered, userId: req.user?.id, startAt,
+    session, template, message, rendered, userId: req.user?.id, startAt, botStart,
   });
 
   res.status(202).json({
@@ -90,7 +165,12 @@ router.post('/send', route(async (req, res) => {
     firstAt: batch.firstAt,
     lastAt: batch.lastAt,
     estimatedMinutes: batch.estimatedMinutes,
-    source: template ? `template:${template}` : 'custom message',
+    source: botStart
+      ? `bot:${botStart.bot.name} at ${botStart.node.node_key}`
+      : (template ? `template:${template}` : 'custom message'),
+    // Every recipient now has a conversation waiting, so a tap or a typed
+    // reply is read as an answer rather than as a new request.
+    conversations: botStart ? rendered.length : 0,
     messageIds: batch.jobs.map((j) => j.id),
   });
 }));

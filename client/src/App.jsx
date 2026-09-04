@@ -13,6 +13,8 @@ import TemplateDetail from './pages/TemplateDetail';
 import Bulk from './pages/Bulk';
 import ScheduledPage from './pages/Scheduled';
 import SchedulesPage from './pages/Schedules';
+import BotsPage from './pages/Bots';
+import BotBuilder from './pages/BotBuilder';
 import WebhooksPage from './pages/Webhooks';
 import './App.css';
 
@@ -46,6 +48,8 @@ export default function App() {
             <Route path="/rules" element={<RulesPage />} />
             <Route path="/scheduled" element={<ScheduledPage />} />
             <Route path="/schedules" element={<SchedulesPage />} />
+            <Route path="/bots" element={<BotsPage />} />
+            <Route path="/bots/:id" element={<BotBuilder />} />
             <Route path="/webhooks" element={<WebhooksPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

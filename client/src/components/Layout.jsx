@@ -4,6 +4,7 @@ import { api } from '../api';
 import { useAuth } from '../AuthContext';
 import { useSession } from '../SessionContext';
 import StatusPill from './StatusPill';
+import ThemeToggle from './ThemeToggle';
 
 const NAV = [
   { to: '/', label: 'Inbox', icon: '💬', end: true },
@@ -18,6 +19,7 @@ const NAV = [
   },
   { to: '/bulk', label: 'Bulk send', icon: '📣' },
   { to: '/schedules', label: 'Schedules', icon: '⏰' },
+  { to: '/bots', label: 'Bot Builder', icon: '🤖' },
   { to: '/rules', label: 'Auto-replies', icon: '⚡' },
   { to: '/scheduled', label: 'Queue', icon: '🕒' },
   { to: '/webhooks', label: 'Webhooks', icon: '🔗' },
@@ -108,6 +110,7 @@ export default function Layout() {
                 : closed}
             </small>
           ) : null}
+          <ThemeToggle />
           <button className="rail__logout" onClick={logout}>Sign out</button>
         </div>
       </aside>
